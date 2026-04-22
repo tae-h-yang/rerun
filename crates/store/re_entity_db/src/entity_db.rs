@@ -788,22 +788,13 @@ impl EntityDb {
             let mut chunks: Vec<Arc<Chunk>> = engine
                 .store()
                 .iter_chunks()
-                .filter(move |chunk| {
-                    if chunk.is_static() {
-                        return true; // always keep all static data
-                    }
-
+                .filter_map(move |chunk| {
                     let Some((timeline, time_range)) = time_filter else {
-                        return true; // no filter -> keep all data
+                        return Some(Arc::clone(chunk)); // no filter -> keep all data
                     };
 
-                    // TODO(cmc): chunk.slice_time_selection(time_selection)
-                    chunk
-                        .timelines()
-                        .get(&timeline)
-                        .is_some_and(|time_column| time_range.intersects(time_column.time_range()))
+                    slice_chunk_to_time_selection(chunk, timeline, time_range).map(Arc::new)
                 })
-                .cloned() // refcount
                 .collect();
 
             // Try to roughly preserve the order of the chunks
@@ -874,6 +865,29 @@ impl EntityDb {
 
         Ok(new_db)
     }
+}
+
+fn slice_chunk_to_time_selection(
+    chunk: &Arc<Chunk>,
+    timeline: TimelineName,
+    time_range: AbsoluteTimeRange,
+) -> Option<Chunk> {
+    if chunk.is_static() {
+        return Some((**chunk).clone());
+    }
+
+    let time_column = chunk.timelines().get(&timeline)?;
+    if !time_range.intersects(time_column.time_range()) {
+        return None;
+    }
+
+    let chunk = chunk.sorted_by_timeline_if_unsorted(&timeline);
+    let times = chunk.timelines().get(&timeline)?.times_raw();
+
+    let start_index = times.partition_point(|time| *time < time_range.min().as_i64());
+    let end_index = times.partition_point(|time| *time <= time_range.max().as_i64());
+
+    (start_index < end_index).then(|| chunk.row_sliced_deep(start_index, end_index - start_index))
 }
 
 /// ## Stats
@@ -1011,7 +1025,7 @@ mod tests {
 
     use re_chunk::{Chunk, RowId};
     use re_log_types::example_components::{MyPoint, MyPoints};
-    use re_log_types::{StoreId, TimePoint, Timeline};
+    use re_log_types::{AbsoluteTimeRangeF, LogMsg, StoreId, TimePoint, Timeline};
 
     use super::*;
 
@@ -1045,6 +1059,70 @@ mod tests {
         assert_eq!(
             db.format_with_components(),
             "/parent\n  /parent/child1\n    /parent/child1/grandchild\n      example.MyPoint: Struct[2]\n"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn to_messages_slices_temporal_chunks_to_crop_range() -> anyhow::Result<()> {
+        let mut db = EntityDb::new(StoreId::random(
+            re_log_types::StoreKind::Recording,
+            "test_app",
+        ));
+
+        let timeline_frame = Timeline::new_sequence("frame");
+        let chunk = Chunk::builder("points")
+            .with_component_batches(
+                RowId::new(),
+                TimePoint::from_iter([(timeline_frame, 10)]),
+                [(
+                    MyPoints::descriptor_points(),
+                    &[MyPoint::new(1.0, 1.0)] as _,
+                )],
+            )
+            .with_component_batches(
+                RowId::new(),
+                TimePoint::from_iter([(timeline_frame, 20)]),
+                [(
+                    MyPoints::descriptor_points(),
+                    &[MyPoint::new(2.0, 2.0)] as _,
+                )],
+            )
+            .with_component_batches(
+                RowId::new(),
+                TimePoint::from_iter([(timeline_frame, 30)]),
+                [(
+                    MyPoints::descriptor_points(),
+                    &[MyPoint::new(3.0, 3.0)] as _,
+                )],
+            )
+            .build()?;
+        db.add_chunk(&Arc::new(chunk))?;
+
+        let messages = db
+            .to_messages(Some((
+                *timeline_frame.name(),
+                AbsoluteTimeRangeF::new(15.0, 25.0),
+            )))
+            .collect::<ChunkResult<Vec<_>>>()?;
+
+        let arrow_chunks = messages
+            .into_iter()
+            .filter_map(|msg| match msg {
+                LogMsg::ArrowMsg(_, msg) => Some(Chunk::from_arrow_msg(&msg)),
+                _ => None,
+            })
+            .collect::<ChunkResult<Vec<_>>>()?;
+
+        assert_eq!(arrow_chunks.len(), 1);
+        assert_eq!(
+            arrow_chunks[0]
+                .timelines()
+                .get(timeline_frame.name())
+                .unwrap()
+                .times_raw(),
+            &[20]
         );
 
         Ok(())

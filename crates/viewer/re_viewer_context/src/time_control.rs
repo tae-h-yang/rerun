@@ -9,8 +9,8 @@ use re_log_types::{
 use re_sdk_types::blueprint::archetypes::TimePanelBlueprint;
 use re_sdk_types::blueprint::components::{LoopMode, PlayState};
 
-use crate::NeedsRepaint;
 use crate::blueprint_helpers::BlueprintContext;
+use crate::NeedsRepaint;
 
 pub const TIME_PANEL_PATH: &str = "time_panel";
 
@@ -244,6 +244,12 @@ pub enum TimeControlCommand {
 
     /// Set the current time selection without enabling looping.
     SetTimeSelection(AbsoluteTimeRange),
+
+    /// Update the start of the current time selection, creating one if needed.
+    SetTimeSelectionStart(TimeInt),
+
+    /// Update the end of the current time selection, creating one if needed.
+    SetTimeSelectionEnd(TimeInt),
 
     /// Remove the current time selection.
     ///
@@ -961,6 +967,12 @@ impl TimeControl {
                     NeedsRepaint::No
                 }
             }
+            TimeControlCommand::SetTimeSelectionStart(time) => {
+                self.set_time_selection_boundary(blueprint_ctx, *time, true)
+            }
+            TimeControlCommand::SetTimeSelectionEnd(time) => {
+                self.set_time_selection_boundary(blueprint_ctx, *time, false)
+            }
             TimeControlCommand::RemoveTimeSelection => {
                 if let Some(state) = self.states.get_mut(self.timeline.name()) {
                     if let Some(blueprint_ctx) = blueprint_ctx {
@@ -1154,6 +1166,34 @@ impl TimeControl {
                 state.time = new_time;
             }
         }
+    }
+
+    fn set_time_selection_boundary(
+        &mut self,
+        blueprint_ctx: Option<&impl BlueprintContext>,
+        new_boundary: TimeInt,
+        update_start: bool,
+    ) -> NeedsRepaint {
+        let Some(state) = self.states.get_mut(self.timeline.name()) else {
+            return NeedsRepaint::No;
+        };
+
+        let updated_range = match state.time_selection.map(|range| range.to_int()) {
+            Some(current_range) if update_start => {
+                AbsoluteTimeRange::new(new_boundary.min(current_range.max()), current_range.max())
+            }
+            Some(current_range) => {
+                AbsoluteTimeRange::new(current_range.min(), current_range.min().max(new_boundary))
+            }
+            None => AbsoluteTimeRange::point(new_boundary),
+        };
+
+        if let Some(blueprint_ctx) = blueprint_ctx {
+            blueprint_ctx.set_time_selection(updated_range);
+        }
+
+        state.time_selection = Some(updated_range.into());
+        NeedsRepaint::Yes
     }
 
     fn pause(&mut self, blueprint_ctx: Option<&impl BlueprintContext>) {
@@ -1412,6 +1452,7 @@ fn default_timeline<'a>(timelines: impl IntoIterator<Item = &'a TimeHistogram>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ViewerContext;
 
     fn with_events(timeline: Timeline, num: u64) -> TimeHistogram {
         let mut stats = TimeHistogram::new(timeline);
@@ -1469,6 +1510,79 @@ mod tests {
         assert_eq!(
             default_timeline([&custom_timeline0]),
             custom_timeline0.timeline()
+        );
+    }
+
+    #[test]
+    fn test_set_time_selection_boundaries() {
+        let timeline = Timeline::new("frame_nr", TimeType::Sequence);
+        let timeline_histograms = TimeHistogramPerTimeline::default();
+        let blueprint_ctx: Option<&ViewerContext<'_>> = None;
+
+        let mut time_control = TimeControl {
+            timeline: ActiveTimeline::UserEdited(timeline),
+            states: BTreeMap::from([(*timeline.name(), TimeState::new(TimeInt::ZERO))]),
+            ..Default::default()
+        };
+
+        let _ = time_control.handle_time_commands(
+            blueprint_ctx,
+            &timeline_histograms,
+            &[TimeControlCommand::SetTimeSelectionStart(
+                TimeInt::new_temporal(10),
+            )],
+        );
+        assert_eq!(
+            time_control.time_selection().map(|range| range.to_int()),
+            Some(AbsoluteTimeRange::new(
+                TimeInt::new_temporal(10),
+                TimeInt::new_temporal(10),
+            ))
+        );
+
+        let _ = time_control.handle_time_commands(
+            blueprint_ctx,
+            &timeline_histograms,
+            &[TimeControlCommand::SetTimeSelectionEnd(
+                TimeInt::new_temporal(25),
+            )],
+        );
+        assert_eq!(
+            time_control.time_selection().map(|range| range.to_int()),
+            Some(AbsoluteTimeRange::new(
+                TimeInt::new_temporal(10),
+                TimeInt::new_temporal(25),
+            ))
+        );
+
+        let _ = time_control.handle_time_commands(
+            blueprint_ctx,
+            &timeline_histograms,
+            &[TimeControlCommand::SetTimeSelectionStart(
+                TimeInt::new_temporal(18),
+            )],
+        );
+        assert_eq!(
+            time_control.time_selection().map(|range| range.to_int()),
+            Some(AbsoluteTimeRange::new(
+                TimeInt::new_temporal(18),
+                TimeInt::new_temporal(25),
+            ))
+        );
+
+        let _ = time_control.handle_time_commands(
+            blueprint_ctx,
+            &timeline_histograms,
+            &[TimeControlCommand::SetTimeSelectionEnd(
+                TimeInt::new_temporal(12),
+            )],
+        );
+        assert_eq!(
+            time_control.time_selection().map(|range| range.to_int()),
+            Some(AbsoluteTimeRange::new(
+                TimeInt::new_temporal(18),
+                TimeInt::new_temporal(18),
+            ))
         );
     }
 }

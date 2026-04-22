@@ -3633,7 +3633,7 @@ fn save_recording(
     };
 
     let title = if loop_selection.is_some() {
-        "Save loop selection"
+        "Save cropped recording"
     } else {
         "Save recording"
     };

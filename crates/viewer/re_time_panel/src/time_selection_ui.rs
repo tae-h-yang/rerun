@@ -29,6 +29,26 @@ pub fn paint_timeline_range(
     }
 }
 
+fn paint_selection_boundaries(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    rect: Rect,
+    min_x: f32,
+    max_x: f32,
+) {
+    let tokens = ui.tokens();
+    let boundary_stroke = egui::Stroke::new(2.0, tokens.alert_warning.stroke);
+    let boundary_cap_color = tokens.alert_warning.icon;
+
+    for &x in &[min_x, max_x] {
+        painter.vline(x, rect.y_range(), boundary_stroke);
+
+        let cap_rect =
+            Rect::from_center_size(egui::pos2(x, rect.top() + 5.0), egui::vec2(8.0, 10.0));
+        painter.rect_filled(cap_rect, tokens.small_corner_radius(), boundary_cap_color);
+    }
+}
+
 pub fn collapsed_loop_selection_ui(
     time_ctrl: &TimeControl,
     painter: &egui::Painter,
@@ -49,6 +69,13 @@ pub fn collapsed_loop_selection_ui(
             time_range_rect,
             color,
         );
+
+        if let (Some(min_x), Some(max_x)) = (
+            time_ranges_ui.x_from_time_f32(loop_range.min),
+            time_ranges_ui.x_from_time_f32(loop_range.max),
+        ) {
+            paint_selection_boundaries(ui, painter, time_range_rect, min_x, max_x);
+        }
     }
 }
 
@@ -257,17 +284,37 @@ fn paint_loop_selection(
     time_commands: &[TimeControlCommand],
 ) -> Option<()> {
     // Use latest range to avoid frame delay
-    let selected_range = time_commands
-        .iter()
-        .rev()
-        .find_map(|c| {
-            if let TimeControlCommand::SetTimeSelection(range) = c {
-                Some(AbsoluteTimeRangeF::from(*range))
-            } else {
-                None
+    let mut selected_range = time_ctrl.time_selection();
+    for command in time_commands {
+        match command {
+            TimeControlCommand::SetTimeSelection(range) => {
+                selected_range = Some(AbsoluteTimeRangeF::from(*range));
             }
-        })
-        .or_else(|| time_ctrl.time_selection())?;
+            TimeControlCommand::SetTimeSelectionStart(time) => {
+                let time = TimeReal::from(*time);
+                selected_range = Some(match selected_range {
+                    Some(mut range) => {
+                        range.min = time.min(range.max);
+                        range
+                    }
+                    None => AbsoluteTimeRangeF::point(time),
+                });
+            }
+            TimeControlCommand::SetTimeSelectionEnd(time) => {
+                let time = TimeReal::from(*time);
+                selected_range = Some(match selected_range {
+                    Some(mut range) => {
+                        range.max = range.min.max(time);
+                        range
+                    }
+                    None => AbsoluteTimeRangeF::point(time),
+                });
+            }
+            TimeControlCommand::RemoveTimeSelection => return None,
+            _ => {}
+        }
+    }
+    let selected_range = selected_range?;
 
     let min_x = time_ranges_ui.x_from_time_f32(selected_range.min)?;
     let max_x = time_ranges_ui.x_from_time_f32(selected_range.max)?;
@@ -307,6 +354,8 @@ fn paint_loop_selection(
         ui.painter().rect_filled(bottom_rect, 0.0, inactive_color);
     }
 
+    paint_selection_boundaries(ui, ui.painter(), full_rect, x_range.min, x_range.max);
+
     None
 }
 
@@ -328,7 +377,7 @@ fn selection_context_menu(
         time_commands.push(TimeControlCommand::RemoveTimeSelection);
     }
 
-    let mut button = egui::Button::new("Save current time selection…");
+    let mut button = egui::Button::new(UICommand::SaveRecordingSelection.text());
     if let Some(shortcut) = UICommand::SaveRecordingSelection.formatted_kb_shortcut(ui.ctx()) {
         button = button.shortcut_text(shortcut);
     }

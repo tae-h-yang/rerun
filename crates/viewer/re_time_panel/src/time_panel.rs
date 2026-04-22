@@ -1882,7 +1882,33 @@ fn timeline_properties_context_menu(
     ctx: &ViewerContext<'_>,
     time_ctrl: &TimeControl,
     hovered_time: TimeReal,
+    time_commands: &mut Vec<TimeControlCommand>,
 ) {
+    let hovered_time_int = hovered_time.floor();
+
+    if ui.button("Set crop start").clicked() {
+        time_commands.push(TimeControlCommand::SetTimeSelectionStart(hovered_time_int));
+        ui.close();
+    }
+
+    if ui.button("Set crop end").clicked() {
+        time_commands.push(TimeControlCommand::SetTimeSelectionEnd(hovered_time_int));
+        ui.close();
+    }
+
+    if ui
+        .add_enabled(
+            time_ctrl.time_selection().is_some(),
+            egui::Button::new("Clear crop range"),
+        )
+        .clicked()
+    {
+        time_commands.push(TimeControlCommand::RemoveTimeSelection);
+        ui.close();
+    }
+
+    ui.separator();
+
     let mut url = ViewerOpenUrl::from_context(ctx);
     let has_fragment = url.as_mut().is_ok_and(|url| {
         if let Some(fragment) = url.fragment_mut() {
@@ -1984,6 +2010,17 @@ impl TimePanel {
         {
             let right_clicked_time_id = egui::Id::new("__right_clicked_time");
 
+            if response.secondary_clicked()
+                && let Some(time) = hovered_time
+            {
+                // TODO(tyang): Prefer the persistent white time marker when setting crop
+                // bounds from the context menu. This currently freezes the right-click
+                // preview time, which is closer, but still not the same interaction.
+                ui.ctx().memory_mut(|mem| {
+                    mem.data.insert_temp(right_clicked_time_id, time);
+                });
+            }
+
             let right_clicked_time = ui
                 .ctx()
                 .memory(|mem| mem.data.get_temp(right_clicked_time_id));
@@ -2005,7 +2042,13 @@ impl TimePanel {
                 let popup_is_open = egui::Popup::context_menu(&response)
                     .width(300.0)
                     .show(|ui| {
-                        timeline_properties_context_menu(ui, ctx, time_ctrl, preview_time);
+                        timeline_properties_context_menu(
+                            ui,
+                            ctx,
+                            time_ctrl,
+                            preview_time,
+                            time_commands,
+                        );
                     })
                     .is_some();
                 if popup_is_open {

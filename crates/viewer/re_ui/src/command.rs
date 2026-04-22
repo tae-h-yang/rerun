@@ -148,8 +148,8 @@ impl UICommand {
             ),
 
             Self::SaveRecordingSelection => (
-                "Save current time selection…",
-                "Save data for the current loop selection to a Rerun data file (.rrd)",
+                "Save cropped recording…",
+                "Save data within the current crop range to a Rerun data file (.rrd)",
             ),
 
             Self::SaveBlueprint => (
@@ -417,7 +417,7 @@ impl UICommand {
 
         match self {
             Self::SaveRecording => smallvec![cmd(Key::S)],
-            Self::SaveRecordingSelection => smallvec![cmd_alt(Key::S)],
+            Self::SaveRecordingSelection => smallvec![cmd_shift(Key::S)],
             Self::SaveBlueprint => smallvec![],
             Self::Open => smallvec![cmd(Key::O)],
             // Some browsers have a "paste and go" action.

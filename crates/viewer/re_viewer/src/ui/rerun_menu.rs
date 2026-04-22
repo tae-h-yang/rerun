@@ -275,7 +275,7 @@ impl App {
                 if ui
                     .add_enabled(loop_selection.is_some(), save_selection_button)
                     .on_hover_text(
-                        "Save data for the current loop selection to a Rerun data file (.rrd)",
+                        "Save data within the current crop range to a Rerun data file (.rrd)",
                     )
                     .clicked()
                 {
