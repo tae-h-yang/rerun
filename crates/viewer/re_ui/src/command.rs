@@ -155,7 +155,7 @@ impl UICommand {
 
             Self::SaveVideoSelection => (
                 "Save video…",
-                "Save the selected view to an MP4 video, using the crop range if one is set",
+                "Save the current viewport layout to an MP4 video, using the crop range if one is set",
             ),
 
             Self::SaveBlueprint => (

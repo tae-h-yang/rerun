@@ -238,3 +238,7 @@ pub const OPTION: Icon = icon_from_path!("../data/icons/option.svg");
 // Action buttons:
 pub const COPY: Icon = icon_from_path!("../data/icons/copy.svg");
 pub const DOWNLOAD: Icon = icon_from_path!("../data/icons/download.svg");
+pub const SAVE_RECORDING: Icon = icon_from_path!("../data/icons/save_recording.svg");
+pub const SAVE_CROPPED_RECORDING: Icon =
+    icon_from_path!("../data/icons/save_cropped_recording.svg");
+pub const SAVE_VIDEO: Icon = icon_from_path!("../data/icons/save_video.svg");

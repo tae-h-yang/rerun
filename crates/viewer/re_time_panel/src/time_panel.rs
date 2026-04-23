@@ -18,7 +18,8 @@ use re_sdk_types::blueprint::components::PanelState;
 use re_sdk_types::reflection::ComponentDescriptorExt as _;
 use re_ui::filter_widget::format_matching_text;
 use re_ui::{
-    ContextExt as _, DesignTokens, Help, IconText, UiExt as _, filter_widget, icons, list_item,
+    ContextExt as _, DesignTokens, Help, IconText, UICommand, UICommandSender as _, UiExt as _,
+    filter_widget, icons, list_item,
 };
 use re_viewer_context::open_url::ViewerOpenUrl;
 use re_viewer_context::{
@@ -1364,14 +1365,16 @@ impl TimePanel {
         if time_range.min() == time_range.max() {
             // Only one time point - showing a slider that can't be moved is just annoying
         } else {
-            let space_needed_for_current_time = match time_ctrl.time_type() {
-                Some(re_chunk_store::TimeType::Sequence) | None => 100.0,
-                Some(re_chunk_store::TimeType::DurationNs) => 200.0,
-                Some(re_chunk_store::TimeType::TimestampNs) => 220.0,
-            };
+            let space_needed_for_current_time = 200.0;
+            let small_icon_button_width =
+                ui.tokens().small_icon_size.x + 2.0 * ui.spacing().button_padding.x;
+            let space_needed_for_export_buttons =
+                3.0 * small_icon_button_width + 2.0 * ui.spacing().item_spacing.x + 8.0;
+            let space_needed_for_controls =
+                space_needed_for_current_time + space_needed_for_export_buttons;
 
             let mut time_range_rect = ui.available_rect_before_wrap();
-            time_range_rect.max.x -= space_needed_for_current_time;
+            time_range_rect.max.x -= space_needed_for_controls;
 
             if time_range_rect.width() > 50.0 {
                 ui.allocate_rect(time_range_rect, egui::Sense::hover());
@@ -1480,30 +1483,73 @@ impl TimePanel {
                 )
             });
 
-            ui.style_mut().spacing.text_edit_width = 200.0;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.style_mut().spacing.text_edit_width = 200.0;
+                ui.spacing_mut().item_spacing.x = 4.0;
 
-            let response = ui.text_edit_singleline(&mut time_str);
-            if response.changed() {
-                self.time_edit_string = Some(time_str.clone());
-            }
-            if response.lost_focus() {
-                if let Some(time_int) =
-                    time_type.parse_time(&time_str, ctx.app_options().timestamp_format)
-                {
-                    time_commands.push(TimeControlCommand::SetTime(time_int.into()));
-                } else {
-                    re_log::warn!("Failed to parse {time_str:?}");
+                self.export_buttons_ui(ctx, time_ctrl, ui);
+
+                let response = ui.text_edit_singleline(&mut time_str);
+                if response.changed() {
+                    self.time_edit_string = Some(time_str.clone());
                 }
-                self.time_edit_string = None;
-            }
-            let response = response.on_hover_text(format!(
-                "Timestamp: {}",
-                re_format::format_int(time_int.as_i64())
-            ));
+                if response.lost_focus() {
+                    if let Some(time_int) =
+                        time_type.parse_time(&time_str, ctx.app_options().timestamp_format)
+                    {
+                        time_commands.push(TimeControlCommand::SetTime(time_int.into()));
+                    } else {
+                        re_log::warn!("Failed to parse {time_str:?}");
+                    }
+                    self.time_edit_string = None;
+                }
+                let response = response.on_hover_text(format!(
+                    "Timestamp: {}",
+                    re_format::format_int(time_int.as_i64())
+                ));
 
-            response.context_menu(|ui| {
-                copy_time_properties_context_menu(ui, time);
+                response.context_menu(|ui| {
+                    copy_time_properties_context_menu(ui, time);
+                });
             });
+        }
+    }
+
+    fn export_buttons_ui(
+        &self,
+        ctx: &ViewerContext<'_>,
+        time_ctrl: &TimeControl,
+        ui: &mut egui::Ui,
+    ) {
+        if ui
+            .small_icon_button(&icons::SAVE_VIDEO, UICommand::SaveVideoSelection.text())
+            .on_hover_text(UICommand::SaveVideoSelection.tooltip())
+            .clicked()
+        {
+            ctx.command_sender().send_ui(UICommand::SaveVideoSelection);
+        }
+
+        if ui
+            .add_enabled(
+                time_ctrl.time_selection().is_some(),
+                ui.small_icon_button_widget(
+                    &icons::SAVE_CROPPED_RECORDING,
+                    UICommand::SaveRecordingSelection.text(),
+                ),
+            )
+            .on_hover_text(UICommand::SaveRecordingSelection.tooltip())
+            .clicked()
+        {
+            ctx.command_sender()
+                .send_ui(UICommand::SaveRecordingSelection);
+        }
+
+        if ui
+            .small_icon_button(&icons::SAVE_RECORDING, UICommand::SaveRecording.text())
+            .on_hover_text(UICommand::SaveRecording.tooltip())
+            .clicked()
+        {
+            ctx.command_sender().send_ui(UICommand::SaveRecording);
         }
     }
 }
