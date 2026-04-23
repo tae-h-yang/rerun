@@ -1884,15 +1884,29 @@ fn timeline_properties_context_menu(
     hovered_time: TimeReal,
     time_commands: &mut Vec<TimeControlCommand>,
 ) {
-    let hovered_time_int = hovered_time.floor();
+    let current_time_int = time_ctrl.time().map(|time| time.floor());
 
-    if ui.button("Set crop start").clicked() {
-        time_commands.push(TimeControlCommand::SetTimeSelectionStart(hovered_time_int));
+    if ui
+        .add_enabled(
+            current_time_int.is_some(),
+            egui::Button::new("Set crop start"),
+        )
+        .clicked()
+        && let Some(current_time_int) = current_time_int
+    {
+        time_commands.push(TimeControlCommand::SetTimeSelectionStart(current_time_int));
         ui.close();
     }
 
-    if ui.button("Set crop end").clicked() {
-        time_commands.push(TimeControlCommand::SetTimeSelectionEnd(hovered_time_int));
+    if ui
+        .add_enabled(
+            current_time_int.is_some(),
+            egui::Button::new("Set crop end"),
+        )
+        .clicked()
+        && let Some(current_time_int) = current_time_int
+    {
+        time_commands.push(TimeControlCommand::SetTimeSelectionEnd(current_time_int));
         ui.close();
     }
 
@@ -2013,9 +2027,8 @@ impl TimePanel {
             if response.secondary_clicked()
                 && let Some(time) = hovered_time
             {
-                // TODO(tyang): Prefer the persistent white time marker when setting crop
-                // bounds from the context menu. This currently freezes the right-click
-                // preview time, which is closer, but still not the same interaction.
+                // Freeze the preview line for the duration of the context menu.
+                // Crop start/end uses the persistent current time marker instead.
                 ui.ctx().memory_mut(|mem| {
                     mem.data.insert_temp(right_clicked_time_id, time);
                 });
