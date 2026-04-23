@@ -165,6 +165,26 @@ This citation format helps ensure that Rerun's development team receives appropr
 facilitates the tool's discovery by other researchers.
 
 # Development
+## Dev environment setup
+
+For local source builds, install `pixi`, `rustc`, and `cargo` first.
+
+On macOS/Linux:
+
+```sh
+curl -fsSL https://pixi.sh/install.sh | sh
+curl https://sh.rustup.rs -sSf | sh
+source "$HOME/.cargo/env"
+rustup install 1.88.0
+rustup default 1.88.0
+```
+
+To build and run the source version of the viewer:
+
+```sh
+pixi run rerun
+```
+
 * [`ARCHITECTURE.md`](ARCHITECTURE.md)
 * [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
 * [`CODE_STYLE.md`](CODE_STYLE.md)
