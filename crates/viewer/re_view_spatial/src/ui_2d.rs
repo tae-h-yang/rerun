@@ -305,6 +305,9 @@ impl SpatialView2D {
             view_builder,
             painter.clip_rect(),
             clear_color,
+            Some(gpu_bridge::RendererPaneMetadata {
+                view_id: query.view_id,
+            }),
         ));
 
         // Make sure to _first_ draw the selected, and *then* the hovered context on top!

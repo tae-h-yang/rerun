@@ -426,6 +426,9 @@ impl SpatialView3D {
             view_builder,
             ui_rect,
             clear_color,
+            Some(gpu_bridge::RendererPaneMetadata {
+                view_id: query.view_id,
+            }),
         ));
 
         // Add egui-rendered spinners/loaders on top of re_renderer content:

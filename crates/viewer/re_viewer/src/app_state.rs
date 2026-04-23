@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::str::FromStr as _;
 
-use ahash::HashMap;
+use ahash::{HashMap, HashSet};
 use egui::Ui;
 use egui::text_edit::TextEditState;
 use egui::text_selection::LabelSelectionState;
@@ -18,10 +18,10 @@ use re_viewer_context::open_url::{self, ViewerOpenUrl};
 use re_viewer_context::{
     AppOptions, ApplicationSelectionState, AsyncRuntimeHandle, AuthContext, BlueprintContext,
     BlueprintUndoState, CommandSender, ComponentUiRegistry, DataQueryResult, DisplayMode,
-    DragAndDropManager, FallbackProviderRegistry, GlobalContext, Item, PerVisualizerInViewClass,
-    SelectionChange, StorageContext, StoreContext, StoreHub, SystemCommand,
-    SystemCommandSender as _, TableStore, TimeControl, TimeControlCommand, ViewClassRegistry,
-    ViewId, ViewStates, ViewerContext, blueprint_timeline,
+    DragAndDropManager, FallbackProviderRegistry, GlobalContext, IndicatedEntities, Item,
+    PerVisualizer, PerVisualizerInViewClass, SelectionChange, StorageContext, StoreContext,
+    StoreHub, SystemCommand, SystemCommandSender as _, TableStore, TimeControl, TimeControlCommand,
+    ViewClassRegistry, ViewId, ViewStates, ViewerContext, VisualizableEntities, blueprint_timeline,
 };
 use re_viewport::ViewportUi;
 use re_viewport_blueprint::ViewportBlueprint;
@@ -796,6 +796,140 @@ impl AppState {
         create_time_control_for(&mut self.time_controls, entity_db, blueprint_ctx)
     }
 
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn render_prepared_viewport_only(
+        &mut self,
+        app_env: &crate::AppEnvironment,
+        ui: &mut egui::Ui,
+        render_ctx: &re_renderer::RenderContext,
+        store_context: &StoreContext<'_>,
+        storage_context: &StorageContext<'_>,
+        reflection: &re_types_core::reflection::Reflection,
+        component_ui_registry: &ComponentUiRegistry,
+        component_fallback_registry: &FallbackProviderRegistry,
+        view_class_registry: &ViewClassRegistry,
+        rx_log: &LogReceiverSet,
+        command_sender: &CommandSender,
+        connection_registry: &ConnectionRegistryHandle,
+        blueprint_query: &LatestAtQuery,
+        viewport_ui: &ViewportUi,
+        active_view_ids: &HashSet<ViewId>,
+        visualizable_entities_per_visualizer: &PerVisualizer<VisualizableEntities>,
+        indicated_entities_per_visualizer: &PerVisualizer<IndicatedEntities>,
+        time_ctrl: &TimeControl,
+    ) {
+        let query_results = {
+            re_tracing::profile_scope!("query_results");
+            viewport_ui
+                .blueprint
+                .views
+                .values()
+                .filter(|view| active_view_ids.contains(&view.id))
+                .map(|view| {
+                    let visualizable_entities = if let Some(view_class) =
+                        view_class_registry.class_entry(view.class_identifier())
+                    {
+                        PerVisualizerInViewClass {
+                            view_class_identifier: view.class_identifier(),
+                            per_visualizer: visualizable_entities_per_visualizer
+                                .iter()
+                                .filter_map(|(vis, ents)| {
+                                    view_class
+                                        .visualizer_system_ids
+                                        .contains(vis)
+                                        .then_some((*vis, ents.clone()))
+                                })
+                                .collect(),
+                        }
+                    } else {
+                        PerVisualizerInViewClass::empty(view.class_identifier())
+                    };
+
+                    (
+                        view.id,
+                        view.contents.execute_query(
+                            store_context,
+                            view_class_registry,
+                            blueprint_query,
+                            &visualizable_entities,
+                        ),
+                    )
+                })
+                .collect::<_>()
+        };
+
+        let drag_and_drop_manager =
+            DragAndDropManager::new(Item::Container(viewport_ui.blueprint.root_container));
+        let egui_ctx = ui.ctx().clone();
+        let display_mode = self.navigation.current();
+        let ctx = ViewerContext {
+            global_context: GlobalContext {
+                is_test: app_env.is_test(),
+                app_options: &self.app_options,
+                reflection,
+                egui_ctx: &egui_ctx,
+                render_ctx,
+                command_sender,
+                connection_registry,
+                display_mode,
+                auth_context: self.auth_state.as_ref(),
+            },
+            component_ui_registry,
+            component_fallback_registry,
+            view_class_registry,
+            connected_receivers: rx_log,
+            store_context,
+            storage_context,
+            visualizable_entities_per_visualizer,
+            indicated_entities_per_visualizer,
+            query_results: &query_results,
+            time_ctrl,
+            blueprint_time_ctrl: &self.blueprint_time_control,
+            selection_state: &self.selection_state,
+            blueprint_query,
+            focused_item: &self.focused_item,
+            drag_and_drop_manager: &drag_and_drop_manager,
+        };
+
+        let query_results = update_overrides_for_views(
+            &ctx,
+            &viewport_ui.blueprint,
+            &mut self.view_states,
+            active_view_ids,
+        );
+
+        let ctx = ViewerContext {
+            global_context: GlobalContext {
+                is_test: app_env.is_test(),
+                app_options: &self.app_options,
+                reflection,
+                egui_ctx: &egui_ctx,
+                render_ctx,
+                command_sender,
+                connection_registry,
+                display_mode,
+                auth_context: self.auth_state.as_ref(),
+            },
+            component_ui_registry,
+            component_fallback_registry,
+            view_class_registry,
+            connected_receivers: rx_log,
+            store_context,
+            storage_context,
+            visualizable_entities_per_visualizer,
+            indicated_entities_per_visualizer,
+            query_results: &query_results,
+            time_ctrl,
+            blueprint_time_ctrl: &self.blueprint_time_control,
+            selection_state: &self.selection_state,
+            blueprint_query,
+            focused_item: &self.focused_item,
+            drag_and_drop_manager: &drag_and_drop_manager,
+        };
+
+        viewport_ui.viewport_ui(ui, &ctx, &mut self.view_states);
+    }
+
     pub fn cleanup(&mut self, store_hub: &StoreHub) {
         re_tracing::profile_function!();
 
@@ -859,6 +993,16 @@ fn update_overrides(
     viewport_blueprint: &ViewportBlueprint,
     view_states: &mut ViewStates,
 ) -> HashMap<ViewId, DataQueryResult> {
+    let active_view_ids = viewport_blueprint.views.keys().copied().collect();
+    update_overrides_for_views(ctx, viewport_blueprint, view_states, &active_view_ids)
+}
+
+fn update_overrides_for_views(
+    ctx: &ViewerContext<'_>,
+    viewport_blueprint: &ViewportBlueprint,
+    view_states: &mut ViewStates,
+    active_view_ids: &HashSet<ViewId>,
+) -> HashMap<ViewId, DataQueryResult> {
     use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
 
     struct OverridesUpdateTask<'a> {
@@ -867,7 +1011,11 @@ fn update_overrides(
         query_result: DataQueryResult,
     }
 
-    for view in viewport_blueprint.views.values() {
+    for view in viewport_blueprint
+        .views
+        .values()
+        .filter(|view| active_view_ids.contains(&view.id))
+    {
         view_states.ensure_state_exists(view.id, view.class(ctx.view_class_registry));
     }
 
@@ -876,6 +1024,7 @@ fn update_overrides(
     let work_items = viewport_blueprint
         .views
         .values()
+        .filter(|view| active_view_ids.contains(&view.id))
         .filter_map(|view| {
             query_results.remove(&view.id).map(|query_result| {
                 let view_state = view_states
@@ -920,6 +1069,24 @@ fn update_overrides(
                 (view.id, query_result)
             },
         )
+        .collect()
+}
+
+pub(crate) fn active_view_ids_for_export(
+    viewport_blueprint: &ViewportBlueprint,
+) -> HashSet<ViewId> {
+    if let Some(view_id) = viewport_blueprint.maximized {
+        return [view_id].into_iter().collect();
+    }
+
+    viewport_blueprint
+        .tree
+        .active_tiles()
+        .into_iter()
+        .filter_map(|tile_id| match viewport_blueprint.tree.tiles.get(tile_id) {
+            Some(egui_tiles::Tile::Pane(view_id)) => Some(*view_id),
+            _ => None,
+        })
         .collect()
 }
 

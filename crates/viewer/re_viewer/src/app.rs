@@ -1,7 +1,9 @@
 use std::ops::Bound;
 use std::str::FromStr as _;
 use std::sync::Arc;
+use std::{iter::once, time::Duration};
 
+use ahash::HashMap;
 use egui::{FocusDirection, Key};
 use itertools::Itertools as _;
 use re_build_info::CrateVersion;
@@ -17,10 +19,12 @@ use re_log_types::{
     ApplicationId, FileSource, LogMsg, RecordingId, StoreId, StoreKind, TableMsg, TimeReal,
 };
 use re_redap_client::ConnectionRegistryHandle;
-use re_renderer::WgpuResourcePoolStatistics;
+use re_renderer::{ScreenshotProcessor, WgpuResourcePoolStatistics};
 use re_sdk_types::blueprint::components::{LoopMode, PlayState};
 use re_ui::egui_ext::context_ext::ContextExt as _;
 use re_ui::{ContextExt as _, UICommand, UICommandSender as _, UiExt as _, notifications};
+use re_view_map::MapView;
+use re_view_spatial::{SpatialView2D, SpatialView3D};
 use re_viewer_context::open_url::{OpenUrlOptions, ViewerOpenUrl, combine_with_base_url};
 use re_viewer_context::store_hub::{BlueprintPersistence, StoreHub, StoreHubStats};
 use re_viewer_context::{
@@ -28,17 +32,27 @@ use re_viewer_context::{
     CommandSender, ComponentUiRegistry, DisplayMode, EditRedapServerModalCommand,
     FallbackProviderRegistry, Item, NeedsRepaint, PublishedViewInfo, RecordingOrTable,
     StorageContext, StoreContext, SystemCommand, SystemCommandSender as _, TableStore,
-    TimeControlCommand, ViewClass, ViewClassRegistry, ViewClassRegistryError, ViewRectPublisher,
-    command_channel, sanitize_file_name,
+    TimeControlCommand, ViewClass, ViewClassRegistry, ViewClassRegistryError, ViewId,
+    ViewRectPublisher, command_channel, gpu_bridge, sanitize_file_name,
 };
+use re_viewport::ViewportUi;
+use re_viewport_blueprint::ViewportBlueprint;
 
 use crate::AppState;
 use crate::app_blueprint::{AppBlueprint, PanelStateOverrides};
 use crate::app_blueprint_ctx::AppBlueprintCtx;
-use crate::app_state::WelcomeScreenState;
+use crate::app_state::{WelcomeScreenState, active_view_ids_for_export};
 use crate::background_tasks::BackgroundTasks;
 use crate::event::ViewerEventDispatcher;
 use crate::startup_options::StartupOptions;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::Write as _;
+#[cfg(not(target_arch = "wasm32"))]
+use std::process::Stdio;
+
+#[cfg(not(target_arch = "wasm32"))]
+const OFFSCREEN_EXPORT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ----------------------------------------------------------------------------
 
@@ -65,19 +79,17 @@ struct PendingFilePromise {
 const CROPPED_VIDEO_EXPORT_PROMISE: &str = "cropped_video_export";
 
 #[cfg(not(target_arch = "wasm32"))]
-#[derive(Clone)]
-struct CroppedVideoFrameRequest {
-    export_id: u64,
-    frame_index: usize,
-    ui_rect: egui::Rect,
-    pixels_per_point: f32,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CroppedVideoExportPhase {
     AwaitRenderedFrame,
-    AwaitScreenshot,
+    AwaitViewScreenshots,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+struct VideoExportView {
+    view_id: ViewId,
+    rect: egui::Rect,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -85,6 +97,15 @@ enum CroppedVideoExportPhase {
 pub(crate) struct VideoExportArea {
     name: String,
     rect: egui::Rect,
+    views: Vec<VideoExportView>,
+    pixels_per_point: f32,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct CapturedVideoViewFrame {
+    image: image::RgbaImage,
+    ui_rect: egui::Rect,
+    pixels_per_point: f32,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -99,9 +120,19 @@ struct CroppedVideoExport {
     temp_dir: std::path::PathBuf,
     frame_times: Vec<TimeInt>,
     frame_index: usize,
-    frames_until_screenshot: u8,
+    frames_until_capture: u8,
     phase: CroppedVideoExportPhase,
     fps: f32,
+    captured_views: HashMap<ViewId, CapturedVideoViewFrame>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct OffscreenViewportRenderer {
+    egui_ctx: egui::Context,
+    renderer: egui_wgpu::Renderer,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    target_format: wgpu::TextureFormat,
 }
 
 /// The Rerun Viewer as an [`eframe`] application.
@@ -140,6 +171,9 @@ pub struct App {
 
     #[cfg(not(target_arch = "wasm32"))]
     next_cropped_video_export_id: u64,
+
+    #[cfg(not(target_arch = "wasm32"))]
+    renderer_video_export_state: Arc<gpu_bridge::RendererVideoExportState>,
 
     /// What is serialized
     pub(crate) state: AppState,
@@ -328,6 +362,9 @@ impl App {
 
         let (command_sender, command_receiver) = command_channel;
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let renderer_video_export_state = Arc::new(gpu_bridge::RendererVideoExportState::default());
+
         let mut component_ui_registry = re_component_ui::create_component_ui_registry();
         re_data_ui::register_component_uis(&mut component_ui_registry);
 
@@ -337,7 +374,16 @@ impl App {
                 re_renderer::device_caps::DeviceCapabilityTier::Limited,
             ),
             |render_state| {
-                let egui_renderer = render_state.renderer.read();
+                let mut egui_renderer = render_state.renderer.write();
+                if egui_renderer
+                    .callback_resources
+                    .get::<Arc<gpu_bridge::RendererVideoExportState>>()
+                    .is_none()
+                {
+                    egui_renderer
+                        .callback_resources
+                        .insert(renderer_video_export_state.clone());
+                }
                 let render_ctx = egui_renderer
                     .callback_resources
                     .get::<re_renderer::RenderContext>();
@@ -481,6 +527,9 @@ impl App {
 
             #[cfg(not(target_arch = "wasm32"))]
             next_cropped_video_export_id: 1,
+
+            #[cfg(not(target_arch = "wasm32"))]
+            renderer_video_export_state,
 
             state,
             background_tasks: Default::default(),
@@ -740,6 +789,7 @@ impl App {
         &self,
         store_context: &StoreContext<'_>,
     ) -> Option<VideoExportArea> {
+        let pixels_per_point = self.egui_ctx.pixels_per_point();
         let blueprint_query = self
             .state
             .get_blueprint_query_for_viewer(store_context.blueprint)?;
@@ -752,10 +802,30 @@ impl App {
             let view_rects = mem.caches.cache::<ViewRectPublisher>();
             let visible_views = viewport
                 .view_ids()
-                .filter_map(|view_id| view_rects.get(view_id).cloned())
+                .filter_map(|view_id| {
+                    let view = viewport.view(view_id)?;
+                    let info = view_rects.get(view_id)?.clone();
+                    Some((*view_id, view.class_identifier(), info))
+                })
                 .collect_vec();
 
-            let mut rects = visible_views.iter().map(|info| info.rect);
+            if visible_views.is_empty()
+                || visible_views.iter().any(|(_, class_identifier, _)| {
+                    !is_renderer_video_export_supported(*class_identifier)
+                })
+            {
+                return None;
+            }
+
+            let visible_view_layouts = visible_views
+                .iter()
+                .map(|(view_id, _, info)| VideoExportView {
+                    view_id: *view_id,
+                    rect: info.rect,
+                })
+                .collect_vec();
+
+            let mut rects = visible_view_layouts.iter().map(|info| info.rect);
             let mut rect = rects.next()?;
             for other in rects {
                 rect = rect.union(other);
@@ -766,37 +836,23 @@ impl App {
                 return None;
             }
 
-            let name = match visible_views.as_slice() {
+            let name = match visible_views
+                .iter()
+                .map(|(_, _, info)| info)
+                .collect_vec()
+                .as_slice()
+            {
                 [PublishedViewInfo { name, .. }] => name.clone(),
                 _ => "viewport".to_owned(),
             };
 
-            Some(VideoExportArea { name, rect })
+            Some(VideoExportArea {
+                name,
+                rect,
+                views: visible_view_layouts,
+                pixels_per_point,
+            })
         })
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn request_cropped_video_frame(
-        &self,
-        export_id: u64,
-        frame_index: usize,
-        export_area: &VideoExportArea,
-    ) -> anyhow::Result<()> {
-        if !export_area.rect.is_positive() {
-            anyhow::bail!("The current viewport layout is too small to export");
-        }
-
-        self.egui_ctx
-            .send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
-                CroppedVideoFrameRequest {
-                    export_id,
-                    frame_index,
-                    ui_rect: export_area.rect,
-                    pixels_per_point: self.egui_ctx.pixels_per_point(),
-                },
-            )));
-
-        Ok(())
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -818,6 +874,7 @@ impl App {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn abort_cropped_video_export(&mut self, reason: anyhow::Error) {
+        self.renderer_video_export_state.clear_request();
         let Some(export) = self.cropped_video_export.take() else {
             re_log::error!("{reason}");
             return;
@@ -838,6 +895,7 @@ impl App {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn finish_cropped_video_capture(&mut self) {
+        self.renderer_video_export_state.clear_request();
         let Some(export) = self.cropped_video_export.take() else {
             return;
         };
@@ -875,11 +933,72 @@ impl App {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn handle_cropped_video_frame(
+    fn prepare_cropped_video_export_frame_request(&mut self) -> Option<(u64, usize, Vec<ViewId>)> {
+        let export = self.cropped_video_export.as_mut()?;
+
+        match export.phase {
+            CroppedVideoExportPhase::AwaitRenderedFrame => {
+                if export.frames_until_capture > 0 {
+                    export.frames_until_capture -= 1;
+                    self.egui_ctx.request_repaint();
+                    None
+                } else {
+                    export.phase = CroppedVideoExportPhase::AwaitViewScreenshots;
+                    Some((
+                        export.export_id,
+                        export.frame_index,
+                        export
+                            .export_area
+                            .views
+                            .iter()
+                            .map(|view| view.view_id)
+                            .collect(),
+                    ))
+                }
+            }
+            CroppedVideoExportPhase::AwaitViewScreenshots => {
+                self.egui_ctx.request_repaint();
+                None
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn collect_cropped_video_view_frames(&mut self, render_ctx: &re_renderer::RenderContext) {
+        let Some(export_id) = self
+            .cropped_video_export
+            .as_ref()
+            .map(|export| export.export_id)
+        else {
+            return;
+        };
+
+        let mut readbacks = Vec::new();
+        while ScreenshotProcessor::next_readback_result(
+            render_ctx,
+            export_id,
+            |data, extent, screenshot: gpu_bridge::RendererVideoExportScreenshot| {
+                readbacks.push((data.to_vec(), extent, screenshot));
+            },
+        )
+        .is_some()
+        {}
+
+        for (data, extent, screenshot) in readbacks {
+            if let Err(err) = self.handle_cropped_video_view_frame(&data, extent, screenshot) {
+                self.abort_cropped_video_export(err);
+                break;
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn handle_cropped_video_view_frame(
         &mut self,
-        image: &Arc<egui::ColorImage>,
-        request: &CroppedVideoFrameRequest,
-    ) -> bool {
+        data: &[u8],
+        extent: glam::UVec2,
+        screenshot: gpu_bridge::RendererVideoExportScreenshot,
+    ) -> anyhow::Result<()> {
         enum NextStep {
             QueueNextFrame {
                 store_id: StoreId,
@@ -889,24 +1008,42 @@ impl App {
         }
 
         let Some(export) = self.cropped_video_export.as_mut() else {
-            return false;
+            return Ok(());
         };
 
-        if export.export_id != request.export_id || export.frame_index != request.frame_index {
-            return false;
-        }
-
-        let frame = image.region(&request.ui_rect, Some(request.pixels_per_point));
-        if let Err(err) =
-            write_cropped_video_frame_png(&export.temp_dir, request.frame_index, &frame)
+        if export.export_id != screenshot.export_id || export.frame_index != screenshot.frame_index
         {
-            self.abort_cropped_video_export(err);
-            return true;
+            return Ok(());
         }
 
-        let next_step = if request.frame_index + 1 < export.frame_times.len() {
+        let Some(view_image) = image::RgbaImage::from_raw(extent.x, extent.y, data.to_vec()) else {
+            anyhow::bail!(
+                "Failed to reconstruct renderer screenshot for {:?}",
+                screenshot.view_id
+            );
+        };
+        export.captured_views.insert(
+            screenshot.view_id,
+            CapturedVideoViewFrame {
+                image: view_image,
+                ui_rect: screenshot.ui_rect,
+                pixels_per_point: screenshot.pixels_per_point,
+            },
+        );
+
+        if export.captured_views.len() < export.export_area.views.len() {
+            self.egui_ctx.request_repaint();
+            return Ok(());
+        }
+
+        let composited =
+            composite_cropped_video_frame(export, self.egui_ctx.style().visuals.panel_fill)?;
+        write_cropped_video_frame_rgba(&export.temp_dir, screenshot.frame_index, &composited)?;
+        export.captured_views.clear();
+
+        let next_step = if screenshot.frame_index + 1 < export.frame_times.len() {
             export.frame_index += 1;
-            export.frames_until_screenshot = 1;
+            export.frames_until_capture = 1;
             export.phase = CroppedVideoExportPhase::AwaitRenderedFrame;
 
             NextStep::QueueNextFrame {
@@ -935,46 +1072,166 @@ impl App {
             }
         }
 
-        true
+        Ok(())
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn drive_cropped_video_export(&mut self) {
-        let action = {
-            let Some(export) = self.cropped_video_export.as_mut() else {
-                return;
-            };
-
-            match export.phase {
-                CroppedVideoExportPhase::AwaitRenderedFrame => {
-                    if export.frames_until_screenshot > 0 {
-                        export.frames_until_screenshot -= 1;
-                        self.egui_ctx.request_repaint();
-                        None
-                    } else {
-                        export.phase = CroppedVideoExportPhase::AwaitScreenshot;
-                        Some((
-                            export.export_id,
-                            export.frame_index,
-                            export.export_area.clone(),
-                        ))
-                    }
-                }
-                CroppedVideoExportPhase::AwaitScreenshot => {
-                    self.egui_ctx.request_repaint();
-                    None
-                }
-            }
+    fn run_offscreen_cropped_video_export(
+        &mut self,
+        frame_render_state: &egui_wgpu::RenderState,
+        store_context: &StoreContext<'_>,
+        storage_context: &StorageContext<'_>,
+    ) {
+        let Some(export) = self.cropped_video_export.take() else {
+            return;
         };
 
-        if let Some((export_id, frame_index, export_area)) = action {
-            if let Err(err) = self.request_cropped_video_frame(export_id, frame_index, &export_area)
-            {
-                self.abort_cropped_video_export(err);
-            } else {
-                self.egui_ctx.request_repaint();
+        match self.run_offscreen_cropped_video_export_inner(
+            frame_render_state,
+            store_context,
+            storage_context,
+            export,
+        ) {
+            Ok((output_path, frame_count, name)) => {
+                re_log::info!(
+                    "Saved {} frame(s) for {:?} to {:?}.",
+                    frame_count,
+                    name,
+                    output_path
+                );
+            }
+            Err(err) => {
+                re_log::error!("{err}");
             }
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn run_offscreen_cropped_video_export_inner(
+        &mut self,
+        frame_render_state: &egui_wgpu::RenderState,
+        store_context: &StoreContext<'_>,
+        storage_context: &StorageContext<'_>,
+        export: CroppedVideoExport,
+    ) -> anyhow::Result<(std::path::PathBuf, usize, String)> {
+        let mut offscreen_renderer =
+            OffscreenViewportRenderer::new(frame_render_state, &self.egui_ctx)?;
+
+        let blueprint_query = self
+            .state
+            .blueprint_query_for_viewer(store_context.blueprint);
+        let viewport_blueprint =
+            ViewportBlueprint::from_db(store_context.blueprint, &blueprint_query);
+        let viewport_ui = ViewportUi::new(viewport_blueprint);
+        if viewport_ui.blueprint.is_invalid() {
+            anyhow::bail!("No valid viewport layout is available for video export");
+        }
+        let active_view_ids = active_view_ids_for_export(&viewport_ui.blueprint);
+        let visualizable_entities_per_visualizer = self
+            .view_class_registry
+            .visualizable_entities_for_visualizer_systems(store_context.recording.store_id());
+        let indicated_entities_per_visualizer = self
+            .view_class_registry
+            .indicated_entities_per_visualizer(store_context.recording.store_id());
+
+        let app_blueprint_ctx = AppBlueprintCtx {
+            command_sender: &self.command_sender,
+            current_blueprint: store_context.blueprint,
+            default_blueprint: store_context.default_blueprint,
+            blueprint_query: blueprint_query.clone(),
+        };
+
+        let mut export_time_controls = HashMap::default();
+        let export_time_ctrl = crate::app_state::create_time_control_for(
+            &mut export_time_controls,
+            store_context.recording,
+            &app_blueprint_ctx,
+        );
+        let _ = export_time_ctrl.handle_time_commands(
+            None::<&AppBlueprintCtx<'_>>,
+            store_context.recording.timeline_histograms(),
+            &[
+                TimeControlCommand::SetActiveTimeline(export.original_timeline),
+                TimeControlCommand::SetPlayState(PlayState::Paused),
+            ],
+        );
+
+        let frame_width = ((export.export_area.rect.width() * export.export_area.pixels_per_point)
+            .round() as u32)
+            .max(1);
+        let frame_height =
+            ((export.export_area.rect.height() * export.export_area.pixels_per_point).round()
+                as u32)
+                .max(1);
+        let mut ffmpeg = spawn_streaming_video_encoder(
+            &export.output_path,
+            export.fps,
+            frame_width,
+            frame_height,
+        )?;
+
+        let temp_dir = export.temp_dir.clone();
+        let result = (|| -> anyhow::Result<(std::path::PathBuf, usize, String)> {
+            for frame_time in export.frame_times.iter().copied() {
+                let _ = export_time_ctrl.handle_time_commands(
+                    None::<&AppBlueprintCtx<'_>>,
+                    store_context.recording.timeline_histograms(),
+                    &[TimeControlCommand::SetTime(frame_time.into())],
+                );
+
+                let image = offscreen_renderer.render_viewport_frame(
+                    export.export_area.rect.size(),
+                    export.export_area.pixels_per_point,
+                    |ctx, render_ctx| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                self.state.render_prepared_viewport_only(
+                                    &self.app_env,
+                                    ui,
+                                    render_ctx,
+                                    store_context,
+                                    storage_context,
+                                    &self.reflection,
+                                    &self.component_ui_registry,
+                                    &self.component_fallback_registry,
+                                    &self.view_class_registry,
+                                    &self.rx_log,
+                                    &self.command_sender,
+                                    &self.connection_registry,
+                                    &blueprint_query,
+                                    &viewport_ui,
+                                    &active_view_ids,
+                                    &visualizable_entities_per_visualizer,
+                                    &indicated_entities_per_visualizer,
+                                    export_time_ctrl,
+                                );
+                            });
+                    },
+                )?;
+
+                write_video_frame_to_ffmpeg(&mut ffmpeg, &image)?;
+            }
+
+            finish_streaming_video_encoder(ffmpeg, &export.output_path)?;
+
+            Ok((
+                export.output_path,
+                export.frame_times.len(),
+                export.export_area.name,
+            ))
+        })();
+
+        if let Err(err) = std::fs::remove_dir_all(&temp_dir)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            re_log::debug!(
+                "Failed to clean up temporary video frames at {:?}: {err}",
+                temp_dir
+            );
+        }
+
+        result
     }
 
     fn run_pending_system_commands(&mut self, store_hub: &mut StoreHub, egui_ctx: &egui::Context) {
@@ -2594,6 +2851,20 @@ impl App {
 
                 self.egui_debug_panel_ui(ui);
 
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(store_context) = store_context
+                    && self.cropped_video_export.is_some()
+                {
+                    let frame_render_state = frame
+                        .wgpu_render_state()
+                        .expect("Failed to get frame render state");
+                    self.run_offscreen_cropped_video_export(
+                        frame_render_state,
+                        store_context,
+                        storage_context,
+                    );
+                }
+
                 let egui_renderer = &mut frame
                     .wgpu_render_state()
                     .expect("Failed to get frame render state")
@@ -2617,6 +2888,21 @@ impl App {
                                 &self.async_runtime,
                                 &self.egui_ctx,
                             );
+                            self.collect_cropped_video_view_frames(render_ctx);
+                        }
+
+                        if is_start_of_new_frame {
+                            if let Some((export_id, frame_index, view_ids)) =
+                                self.prepare_cropped_video_export_frame_request()
+                            {
+                                self.renderer_video_export_state.set_request(
+                                    export_id,
+                                    frame_index,
+                                    view_ids,
+                                );
+                            } else {
+                                self.renderer_video_export_state.clear_request();
+                            }
                         }
 
                         let mut startup_options = self.startup_options.clone();
@@ -3292,17 +3578,6 @@ impl App {
         image: &Arc<egui::ColorImage>,
         user_data: &egui::UserData,
     ) {
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(info) = user_data
-            .data
-            .as_ref()
-            .and_then(|data| data.downcast_ref::<CroppedVideoFrameRequest>())
-            .cloned()
-        {
-            let _ = self.handle_cropped_video_frame(image, &info);
-            return;
-        }
-
         use re_viewer_context::ScreenshotInfo;
 
         if let Some(info) = user_data
@@ -3770,9 +4045,6 @@ impl eframe::App for App {
                 self.process_screenshot_result(&image, &user_data);
             }
         }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        self.drive_cropped_video_export();
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -4074,9 +4346,10 @@ fn save_cropped_video(
         temp_dir,
         frame_times,
         frame_index: 0,
-        frames_until_screenshot: 1,
+        frames_until_capture: 1,
         phase: CroppedVideoExportPhase::AwaitRenderedFrame,
         fps,
+        captured_views: HashMap::default(),
     };
 
     let first_time = export.frame_times[0];
@@ -4113,6 +4386,159 @@ fn save_active_recording(
     };
 
     save_recording(app, entity_db, loop_selection)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl OffscreenViewportRenderer {
+    fn new(
+        frame_render_state: &egui_wgpu::RenderState,
+        live_egui_ctx: &egui::Context,
+    ) -> anyhow::Result<Self> {
+        let egui_ctx = egui::Context::default();
+        egui_ctx.set_theme(live_egui_ctx.theme());
+        egui_ctx.set_os(live_egui_ctx.os());
+        egui_ctx.set_style((*live_egui_ctx.style()).clone());
+        re_ui::apply_style_and_install_loaders(&egui_ctx);
+
+        let mut renderer = egui_wgpu::Renderer::new(
+            &frame_render_state.device,
+            frame_render_state.target_format,
+            egui_wgpu::RendererOptions::default(),
+        );
+        renderer
+            .callback_resources
+            .insert(re_renderer::RenderContext::new(
+                &frame_render_state.adapter,
+                frame_render_state.device.clone(),
+                frame_render_state.queue.clone(),
+                frame_render_state.target_format,
+                re_renderer::RenderConfig::best_for_device_caps,
+            )?);
+
+        Ok(Self {
+            egui_ctx,
+            renderer,
+            device: frame_render_state.device.clone(),
+            queue: frame_render_state.queue.clone(),
+            target_format: frame_render_state.target_format,
+        })
+    }
+
+    fn render_ctx(&self) -> &re_renderer::RenderContext {
+        self.renderer
+            .callback_resources
+            .get::<re_renderer::RenderContext>()
+            .expect("offscreen renderer is missing RenderContext")
+    }
+
+    fn render_ctx_mut(&mut self) -> &mut re_renderer::RenderContext {
+        self.renderer
+            .callback_resources
+            .get_mut::<re_renderer::RenderContext>()
+            .expect("offscreen renderer is missing RenderContext")
+    }
+
+    fn render_viewport_frame(
+        &mut self,
+        size_in_points: egui::Vec2,
+        pixels_per_point: f32,
+        run_ui: impl FnOnce(&egui::Context, &re_renderer::RenderContext),
+    ) -> anyhow::Result<image::RgbaImage> {
+        self.render_ctx_mut().begin_frame();
+
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size_in_points)),
+            ..Default::default()
+        };
+        let viewport = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+        viewport.native_pixels_per_point = Some(pixels_per_point);
+
+        let render_ctx = self.render_ctx();
+        let mut run_ui = Some(run_ui);
+        let output = self.egui_ctx.run(input, |ctx| {
+            run_ui
+                .take()
+                .expect("offscreen viewport frame should render once")(ctx, render_ctx)
+        });
+        self.render_ctx_mut().before_submit();
+
+        for (id, image) in &output.textures_delta.set {
+            self.renderer
+                .update_texture(&self.device, &self.queue, *id, image);
+        }
+
+        let size = size_in_points * pixels_per_point;
+        let screen = egui_wgpu::ScreenDescriptor {
+            pixels_per_point,
+            size_in_pixels: [size.x.round() as u32, size.y.round() as u32],
+        };
+        let tessellated = self
+            .egui_ctx
+            .tessellate(output.shapes.clone(), pixels_per_point);
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Offscreen video export encoder"),
+            });
+
+        let user_buffers = self.renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &tessellated,
+            &screen,
+        );
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Offscreen video export texture"),
+            size: wgpu::Extent3d {
+                width: screen.size_in_pixels[0],
+                height: screen.size_in_pixels[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        {
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Offscreen video export render pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &texture_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    ..Default::default()
+                })
+                .forget_lifetime();
+
+            self.renderer.render(&mut pass, &tessellated, &screen);
+        }
+
+        self.queue
+            .submit(user_buffers.into_iter().chain(once(encoder.finish())));
+        self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(OFFSCREEN_EXPORT_WAIT_TIMEOUT),
+        })?;
+
+        for id in &output.textures_delta.free {
+            self.renderer.free_texture(id);
+        }
+
+        read_texture_to_image(&self.device, &self.queue, &texture, self.target_format)
+    }
 }
 
 fn save_recording(
@@ -4308,22 +4734,128 @@ fn cropped_video_frame_path(temp_dir: &std::path::Path, frame_index: usize) -> s
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn write_cropped_video_frame_png(
+fn write_cropped_video_frame_rgba(
     temp_dir: &std::path::Path,
     frame_index: usize,
-    image: &egui::ColorImage,
+    image: &image::RgbaImage,
 ) -> anyhow::Result<()> {
-    use image::ImageEncoder as _;
-
     let path = cropped_video_frame_path(temp_dir, frame_index);
-    let mut file = std::fs::File::create(&path)?;
-    image::codecs::png::PngEncoder::new(&mut file).write_image(
-        image.as_raw(),
-        image.width() as u32,
-        image.height() as u32,
-        image::ExtendedColorType::Rgba8,
-    )?;
+    image.save(&path)?;
     Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn composite_cropped_video_frame(
+    export: &mut CroppedVideoExport,
+    background_fill: egui::Color32,
+) -> anyhow::Result<image::RgbaImage> {
+    let width = ((export.export_area.rect.width() * export.export_area.pixels_per_point).round()
+        as u32)
+        .max(1);
+    let height = ((export.export_area.rect.height() * export.export_area.pixels_per_point).round()
+        as u32)
+        .max(1);
+
+    let mut composited =
+        image::RgbaImage::from_pixel(width, height, image::Rgba(background_fill.to_array()));
+
+    for view in &export.export_area.views {
+        let Some(view_frame) = export.captured_views.get(&view.view_id) else {
+            anyhow::bail!("Missing captured view image for {:?}", view.view_id);
+        };
+
+        let min =
+            (view_frame.ui_rect.min - export.export_area.rect.min) * view_frame.pixels_per_point;
+        image::imageops::overlay(
+            &mut composited,
+            &view_frame.image,
+            min.x.round() as i64,
+            min.y.round() as i64,
+        );
+    }
+
+    Ok(composited)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_renderer_video_export_supported(class_identifier: re_sdk_types::ViewClassIdentifier) -> bool {
+    class_identifier == SpatialView2D::identifier()
+        || class_identifier == SpatialView3D::identifier()
+        || class_identifier == MapView::identifier()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_texture_to_image(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    texture_format: wgpu::TextureFormat,
+) -> anyhow::Result<image::RgbaImage> {
+    let width = texture.width() as usize;
+    let height = texture.height() as usize;
+    let unpadded_bytes_per_row = width * std::mem::size_of::<u32>();
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+    let padded_bytes_per_row = (unpadded_bytes_per_row + align - 1) / align * align;
+
+    let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Offscreen video export readback"),
+        size: (padded_bytes_per_row * height) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Offscreen video export readback encoder"),
+    });
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &output_buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bytes_per_row as u32),
+                rows_per_image: None,
+            },
+        },
+        wgpu::Extent3d {
+            width: texture.width(),
+            height: texture.height(),
+            depth_or_array_layers: 1,
+        },
+    );
+
+    let submission_index = queue.submit(once(encoder.finish()));
+    let buffer_slice = output_buffer.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    device.poll(wgpu::PollType::Wait {
+        submission_index: Some(submission_index),
+        timeout: Some(OFFSCREEN_EXPORT_WAIT_TIMEOUT),
+    })?;
+    receiver.recv()?.map_err(anyhow::Error::from)?;
+
+    let data = output_buffer
+        .slice(..)
+        .get_mapped_range()
+        .chunks_exact(padded_bytes_per_row)
+        .flat_map(|row| row.iter().take(unpadded_bytes_per_row))
+        .copied()
+        .collect::<Vec<_>>();
+
+    let mut image = image::RgbaImage::from_raw(texture.width(), texture.height(), data)
+        .ok_or_else(|| anyhow::anyhow!("Failed to convert offscreen texture to RGBA image"))?;
+
+    if texture_format == wgpu::TextureFormat::Bgra8Unorm
+        || texture_format == wgpu::TextureFormat::Bgra8UnormSrgb
+    {
+        for pixel in image.pixels_mut() {
+            pixel.0.swap(0, 2);
+        }
+    }
+
+    Ok(image)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -4365,6 +4897,67 @@ fn encode_cropped_video_frames(
             "Failed to clean up temporary video frames at {:?}: {err}",
             temp_dir
         );
+    }
+
+    Ok(output_path.to_path_buf())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_streaming_video_encoder(
+    output_path: &std::path::Path,
+    fps: f32,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<std::process::Child> {
+    Ok(std::process::Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-pixel_format")
+        .arg("rgba")
+        .arg("-video_size")
+        .arg(format!("{width}x{height}"))
+        .arg("-framerate")
+        .arg(fps.to_string())
+        .arg("-i")
+        .arg("-")
+        .arg("-vf")
+        .arg("pad=ceil(iw/2)*2:ceil(ih/2)*2")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg(output_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_video_frame_to_ffmpeg(
+    ffmpeg: &mut std::process::Child,
+    image: &image::RgbaImage,
+) -> anyhow::Result<()> {
+    let stdin = ffmpeg
+        .stdin
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("ffmpeg stdin was not available for video export"))?;
+    stdin.write_all(image.as_raw())?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn finish_streaming_video_encoder(
+    mut ffmpeg: std::process::Child,
+    output_path: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    drop(ffmpeg.stdin.take());
+    let output = ffmpeg.wait_with_output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ffmpeg failed to encode {:?}: {stderr}", output_path);
     }
 
     Ok(output_path.to_path_buf())

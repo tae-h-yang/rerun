@@ -10280,6 +10280,7 @@ dependencies = [
  "egui-wgpu",
  "egui_kittest",
  "egui_plot",
+ "egui_tiles",
  "ehttp",
  "emath",
  "glam",

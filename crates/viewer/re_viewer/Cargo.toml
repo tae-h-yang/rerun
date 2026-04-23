@@ -125,6 +125,7 @@ eframe = { workspace = true, default-features = false, features = [
   "wgpu",
 ] }
 egui_plot.workspace = true
+egui_tiles.workspace = true
 egui-wgpu.workspace = true
 egui.workspace = true
 ehttp.workspace = true

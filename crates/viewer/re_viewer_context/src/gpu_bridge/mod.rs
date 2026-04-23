@@ -17,7 +17,10 @@ use re_renderer::{
         GpuTexture2D, ImageDataDesc, ImageDataToTextureError, TextureManager2DError,
     },
 };
-pub use re_renderer_callback::new_renderer_callback;
+pub use re_renderer_callback::{
+    RendererPaneMetadata, RendererVideoExportScreenshot, RendererVideoExportState,
+    new_renderer_callback,
+};
 
 use crate::TensorStats;
 
@@ -182,6 +185,7 @@ pub fn render_image(
         view_builder,
         viewport,
         re_renderer::Rgba::TRANSPARENT,
+        None,
     ));
 
     Ok(())

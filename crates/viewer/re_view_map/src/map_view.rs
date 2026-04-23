@@ -333,6 +333,9 @@ impl ViewClass for MapView {
             view_builder,
             map_rect,
             re_renderer::Rgba::TRANSPARENT,
+            Some(gpu_bridge::RendererPaneMetadata {
+                view_id: query.view_id,
+            }),
         ));
 
         //
