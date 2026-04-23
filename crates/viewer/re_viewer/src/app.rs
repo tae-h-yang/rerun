@@ -1,3 +1,4 @@
+use std::ops::Bound;
 use std::str::FromStr as _;
 use std::sync::Arc;
 
@@ -5,14 +6,16 @@ use egui::{FocusDirection, Key};
 use itertools::Itertools as _;
 use re_build_info::CrateVersion;
 use re_capabilities::MainThreadToken;
-use re_chunk::TimelineName;
+use re_chunk::{TimeInt, TimelineName};
 use re_data_source::{AuthErrorHandler, FileContents, LogDataSource};
 use re_entity_db::InstancePath;
 use re_entity_db::entity_db::EntityDb;
 use re_log_channel::{
     DataSourceMessage, DataSourceUiCommand, LogReceiver, LogReceiverSet, LogSource,
 };
-use re_log_types::{ApplicationId, FileSource, LogMsg, RecordingId, StoreId, StoreKind, TableMsg};
+use re_log_types::{
+    ApplicationId, FileSource, LogMsg, RecordingId, StoreId, StoreKind, TableMsg, TimeReal,
+};
 use re_redap_client::ConnectionRegistryHandle;
 use re_renderer::WgpuResourcePoolStatistics;
 use re_sdk_types::blueprint::components::{LoopMode, PlayState};
@@ -23,9 +26,10 @@ use re_viewer_context::store_hub::{BlueprintPersistence, StoreHub, StoreHubStats
 use re_viewer_context::{
     AppOptions, AsyncRuntimeHandle, AuthContext, BlueprintUndoState, CommandReceiver,
     CommandSender, ComponentUiRegistry, DisplayMode, EditRedapServerModalCommand,
-    FallbackProviderRegistry, Item, NeedsRepaint, RecordingOrTable, StorageContext, StoreContext,
-    SystemCommand, SystemCommandSender as _, TableStore, TimeControlCommand, ViewClass,
-    ViewClassRegistry, ViewClassRegistryError, command_channel, sanitize_file_name,
+    FallbackProviderRegistry, Item, NeedsRepaint, PublishedViewInfo, RecordingOrTable,
+    StorageContext, StoreContext, SystemCommand, SystemCommandSender as _, TableStore,
+    TimeControlCommand, ViewClass, ViewClassRegistry, ViewClassRegistryError, ViewRectPublisher,
+    command_channel, sanitize_file_name,
 };
 
 use crate::AppState;
@@ -55,6 +59,49 @@ struct PendingFilePromise {
     recommended_store_id: Option<StoreId>,
     force_store_info: bool,
     promise: poll_promise::Promise<Vec<re_data_source::FileContents>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const CROPPED_VIDEO_EXPORT_PROMISE: &str = "cropped_video_export";
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+struct CroppedVideoFrameRequest {
+    export_id: u64,
+    frame_index: usize,
+    ui_rect: egui::Rect,
+    pixels_per_point: f32,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CroppedVideoExportPhase {
+    AwaitRenderedFrame,
+    AwaitScreenshot,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub(crate) struct VideoExportArea {
+    name: String,
+    rect: egui::Rect,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct CroppedVideoExport {
+    export_id: u64,
+    store_id: StoreId,
+    original_timeline: TimelineName,
+    original_time: Option<TimeReal>,
+    original_play_state: PlayState,
+    export_area: VideoExportArea,
+    output_path: std::path::PathBuf,
+    temp_dir: std::path::PathBuf,
+    frame_times: Vec<TimeInt>,
+    frame_index: usize,
+    frames_until_screenshot: u8,
+    phase: CroppedVideoExportPhase,
+    fps: f32,
 }
 
 /// The Rerun Viewer as an [`eframe`] application.
@@ -87,6 +134,12 @@ pub struct App {
 
     #[cfg(target_arch = "wasm32")]
     open_files_promise: Option<PendingFilePromise>,
+
+    #[cfg(not(target_arch = "wasm32"))]
+    cropped_video_export: Option<CroppedVideoExport>,
+
+    #[cfg(not(target_arch = "wasm32"))]
+    next_cropped_video_export_id: u64,
 
     /// What is serialized
     pub(crate) state: AppState,
@@ -423,6 +476,12 @@ impl App {
             #[cfg(target_arch = "wasm32")]
             open_files_promise: Default::default(),
 
+            #[cfg(not(target_arch = "wasm32"))]
+            cropped_video_export: None,
+
+            #[cfg(not(target_arch = "wasm32"))]
+            next_cropped_video_export_id: 1,
+
             state,
             background_tasks: Default::default(),
             store_hub: Some(StoreHub::new(
@@ -665,6 +724,256 @@ impl App {
     fn check_keyboard_shortcuts(&self, egui_ctx: &egui::Context) {
         if let Some(cmd) = UICommand::listen_for_kb_shortcut(egui_ctx) {
             self.command_sender.send_ui(cmd);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn is_cropped_video_busy(&self) -> bool {
+        self.cropped_video_export.is_some()
+            || self
+                .background_tasks
+                .is_promise_in_progress(CROPPED_VIDEO_EXPORT_PROMISE)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn video_export_area(
+        &self,
+        store_context: &StoreContext<'_>,
+    ) -> Option<VideoExportArea> {
+        let blueprint_query = self
+            .state
+            .get_blueprint_query_for_viewer(store_context.blueprint)?;
+        let viewport = re_viewport_blueprint::ViewportBlueprint::from_db(
+            store_context.blueprint,
+            &blueprint_query,
+        );
+
+        self.egui_ctx.memory_mut(|mem| {
+            let view_rects = mem.caches.cache::<ViewRectPublisher>();
+            let visible_views = viewport
+                .view_ids()
+                .filter_map(|view_id| view_rects.get(view_id).cloned())
+                .collect_vec();
+
+            let mut rects = visible_views.iter().map(|info| info.rect);
+            let mut rect = rects.next()?;
+            for other in rects {
+                rect = rect.union(other);
+            }
+            rect = rect.shrink(2.5);
+
+            if !rect.is_positive() {
+                return None;
+            }
+
+            let name = match visible_views.as_slice() {
+                [PublishedViewInfo { name, .. }] => name.clone(),
+                _ => "viewport".to_owned(),
+            };
+
+            Some(VideoExportArea { name, rect })
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn request_cropped_video_frame(
+        &self,
+        export_id: u64,
+        frame_index: usize,
+        export_area: &VideoExportArea,
+    ) -> anyhow::Result<()> {
+        if !export_area.rect.is_positive() {
+            anyhow::bail!("The current viewport layout is too small to export");
+        }
+
+        self.egui_ctx
+            .send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
+                CroppedVideoFrameRequest {
+                    export_id,
+                    frame_index,
+                    ui_rect: export_area.rect,
+                    pixels_per_point: self.egui_ctx.pixels_per_point(),
+                },
+            )));
+
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn restore_after_cropped_video_export(&self, export: &CroppedVideoExport) {
+        let mut time_commands = vec![TimeControlCommand::SetActiveTimeline(
+            export.original_timeline,
+        )];
+        if let Some(time) = export.original_time {
+            time_commands.push(TimeControlCommand::SetTime(time));
+        }
+        time_commands.push(TimeControlCommand::SetPlayState(export.original_play_state));
+
+        self.command_sender
+            .send_system(SystemCommand::TimeControlCommands {
+                store_id: export.store_id.clone(),
+                time_commands,
+            });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn abort_cropped_video_export(&mut self, reason: anyhow::Error) {
+        let Some(export) = self.cropped_video_export.take() else {
+            re_log::error!("{reason}");
+            return;
+        };
+
+        self.restore_after_cropped_video_export(&export);
+        if let Err(err) = std::fs::remove_dir_all(&export.temp_dir)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            re_log::debug!(
+                "Failed to clean up temporary video frames at {:?}: {err}",
+                export.temp_dir
+            );
+        }
+
+        re_log::error!("{reason}");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn finish_cropped_video_capture(&mut self) {
+        let Some(export) = self.cropped_video_export.take() else {
+            return;
+        };
+
+        self.restore_after_cropped_video_export(&export);
+
+        let output_path = export.output_path.clone();
+        let temp_dir = export.temp_dir.clone();
+        let temp_dir_for_encoding = temp_dir.clone();
+        let fps = export.fps;
+
+        if let Err(err) = self
+            .background_tasks
+            .spawn_threaded_promise(CROPPED_VIDEO_EXPORT_PROMISE, move || {
+                encode_cropped_video_frames(&temp_dir_for_encoding, &output_path, fps)
+            })
+        {
+            if let Err(cleanup_err) = std::fs::remove_dir_all(&temp_dir)
+                && cleanup_err.kind() != std::io::ErrorKind::NotFound
+            {
+                re_log::debug!(
+                    "Failed to clean up temporary video frames at {:?}: {cleanup_err}",
+                    temp_dir
+                );
+            }
+            re_log::error!("Failed to start cropped video export: {err}");
+            return;
+        }
+
+        re_log::info!(
+            "Captured {} frame(s) for {:?}; encoding MP4 in the background.",
+            export.frame_times.len(),
+            export.export_area.name
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn handle_cropped_video_frame(
+        &mut self,
+        image: &Arc<egui::ColorImage>,
+        request: &CroppedVideoFrameRequest,
+    ) -> bool {
+        enum NextStep {
+            QueueNextFrame {
+                store_id: StoreId,
+                next_time: TimeReal,
+            },
+            Finish,
+        }
+
+        let Some(export) = self.cropped_video_export.as_mut() else {
+            return false;
+        };
+
+        if export.export_id != request.export_id || export.frame_index != request.frame_index {
+            return false;
+        }
+
+        let frame = image.region(&request.ui_rect, Some(request.pixels_per_point));
+        if let Err(err) =
+            write_cropped_video_frame_png(&export.temp_dir, request.frame_index, &frame)
+        {
+            self.abort_cropped_video_export(err);
+            return true;
+        }
+
+        let next_step = if request.frame_index + 1 < export.frame_times.len() {
+            export.frame_index += 1;
+            export.frames_until_screenshot = 1;
+            export.phase = CroppedVideoExportPhase::AwaitRenderedFrame;
+
+            NextStep::QueueNextFrame {
+                store_id: export.store_id.clone(),
+                next_time: export.frame_times[export.frame_index].into(),
+            }
+        } else {
+            NextStep::Finish
+        };
+
+        match next_step {
+            NextStep::QueueNextFrame {
+                store_id,
+                next_time,
+            } => {
+                self.command_sender
+                    .send_system(SystemCommand::TimeControlCommands {
+                        store_id,
+                        time_commands: vec![TimeControlCommand::SetTime(next_time)],
+                    });
+                self.egui_ctx.request_repaint();
+            }
+            NextStep::Finish => {
+                self.finish_cropped_video_capture();
+                self.egui_ctx.request_repaint();
+            }
+        }
+
+        true
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drive_cropped_video_export(&mut self) {
+        let action = {
+            let Some(export) = self.cropped_video_export.as_mut() else {
+                return;
+            };
+
+            match export.phase {
+                CroppedVideoExportPhase::AwaitRenderedFrame => {
+                    if export.frames_until_screenshot > 0 {
+                        export.frames_until_screenshot -= 1;
+                        self.egui_ctx.request_repaint();
+                        None
+                    } else {
+                        export.phase = CroppedVideoExportPhase::AwaitScreenshot;
+                        Some((
+                            export.export_id,
+                            export.frame_index,
+                            export.export_area.clone(),
+                        ))
+                    }
+                }
+                CroppedVideoExportPhase::AwaitScreenshot => {
+                    self.egui_ctx.request_repaint();
+                    None
+                }
+            }
+        };
+
+        if let Some((export_id, frame_index, export_area)) = action {
+            if let Err(err) = self.request_cropped_video_frame(export_id, frame_index, &export_area)
+            {
+                self.abort_cropped_video_export(err);
+            } else {
+                self.egui_ctx.request_repaint();
+            }
         }
     }
 
@@ -1573,6 +1882,16 @@ impl App {
                 ) {
                     re_log::error!("Failed to save recording: {err}");
                 }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            UICommand::SaveVideoSelection => {
+                if let Err(err) = save_cropped_video(self, store_context) {
+                    re_log::error!("Failed to save cropped video: {err}");
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            UICommand::SaveVideoSelection => {
+                re_log::warn!("Saving cropped videos is not supported in the web viewer.");
             }
 
             UICommand::SaveBlueprint => {
@@ -2973,6 +3292,17 @@ impl App {
         image: &Arc<egui::ColorImage>,
         user_data: &egui::UserData,
     ) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(info) = user_data
+            .data
+            .as_ref()
+            .and_then(|data| data.downcast_ref::<CroppedVideoFrameRequest>())
+            .cloned()
+        {
+            let _ = self.handle_cropped_video_frame(image, &info);
+            return;
+        }
+
         use re_viewer_context::ScreenshotInfo;
 
         if let Some(info) = user_data
@@ -3287,6 +3617,12 @@ impl eframe::App for App {
         self.state.cleanup(&store_hub);
 
         file_saver_progress_ui(egui_ctx, &mut self.background_tasks); // toasts for background file saver
+        #[cfg(not(target_arch = "wasm32"))]
+        cropped_video_export_progress_ui(
+            egui_ctx,
+            &mut self.background_tasks,
+            self.cropped_video_export.as_ref(),
+        );
 
         // Make sure some app is active
         // Must be called before `read_context` below.
@@ -3434,6 +3770,9 @@ impl eframe::App for App {
                 self.process_screenshot_result(&image, &user_data);
             }
         }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        self.drive_cropped_video_export();
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -3550,6 +3889,63 @@ fn file_saver_progress_ui(egui_ctx: &egui::Context, background_tasks: &mut Backg
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn cropped_video_export_progress_ui(
+    egui_ctx: &egui::Context,
+    background_tasks: &mut BackgroundTasks,
+    export: Option<&CroppedVideoExport>,
+) {
+    if let Some(res) = background_tasks
+        .poll_promise::<anyhow::Result<std::path::PathBuf>>(CROPPED_VIDEO_EXPORT_PROMISE)
+    {
+        match res {
+            Ok(path) => {
+                re_log::info!("Cropped video saved to {path:?}.");
+            }
+            Err(err) => {
+                re_log::error!("{err}");
+            }
+        }
+    }
+
+    let Some((title, details)) = export
+        .map(|export| {
+            (
+                "cropped_video_capture_spin",
+                format!(
+                    "Capturing cropped video… {}/{}",
+                    export.frame_index + 1,
+                    export.frame_times.len()
+                ),
+            )
+        })
+        .or_else(|| {
+            background_tasks
+                .is_promise_in_progress(CROPPED_VIDEO_EXPORT_PROMISE)
+                .then(|| {
+                    (
+                        "cropped_video_encode_spin",
+                        "Encoding cropped video…".to_owned(),
+                    )
+                })
+        })
+    else {
+        return;
+    };
+
+    egui::Window::new(title)
+        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(0.0, -36.0))
+        .title_bar(false)
+        .enabled(false)
+        .auto_sized()
+        .show(egui_ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(details);
+            });
+        });
+}
+
 /// [This may only be called on the main thread](https://docs.rs/rfd/latest/rfd/#macos-non-windowed-applications-async-and-threading).
 #[cfg(not(target_arch = "wasm32"))]
 fn open_file_dialog_native(_: crate::MainThreadToken) -> Vec<std::path::PathBuf> {
@@ -3598,6 +3994,112 @@ async fn async_open_rrd_dialog() -> Vec<re_data_source::FileContents> {
     }
 
     file_contents
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn save_cropped_video(
+    app: &mut App,
+    store_context: Option<&StoreContext<'_>>,
+) -> anyhow::Result<()> {
+    let Some(store_context) = store_context else {
+        anyhow::bail!("No recording data to export");
+    };
+
+    if app.is_cropped_video_busy() {
+        anyhow::bail!("A cropped video export is already in progress");
+    }
+
+    ensure_ffmpeg_available()?;
+
+    let Some(export_area) = app.video_export_area(store_context) else {
+        anyhow::bail!("No visible viewport layout is available for video export");
+    };
+
+    let time_ctrl = app
+        .state
+        .time_control(store_context.recording.store_id())
+        .ok_or_else(|| anyhow::anyhow!("No time control available for the active recording"))?;
+
+    let timeline = *time_ctrl.timeline_name();
+    let Some(histogram) = store_context.recording.timeline_histograms().get(&timeline) else {
+        anyhow::bail!("The active timeline has no temporal data");
+    };
+
+    let crop_range = app
+        .state
+        .loop_selection(Some(store_context))
+        .filter(|(selection_timeline, _)| *selection_timeline == timeline)
+        .map(|(_, range)| range.to_int())
+        .unwrap_or_else(|| histogram.full_range());
+
+    let frame_times = histogram
+        .range(
+            (
+                Bound::Included(crop_range.min().as_i64()),
+                Bound::Included(crop_range.max().as_i64()),
+            ),
+            1,
+        )
+        .map(|(range, _count)| TimeInt::new_temporal(range.min))
+        .collect_vec();
+
+    if frame_times.is_empty() {
+        anyhow::bail!("The current crop range contains no frames on the active timeline");
+    }
+
+    let default_file_name = format!("{}.mp4", sanitize_file_name(&export_area.name));
+    let Some(output_path) = rfd::FileDialog::new()
+        .set_file_name(default_file_name)
+        .set_title("Save video")
+        .save_file()
+    else {
+        re_log::info!("No file selected - video not saved.");
+        return Ok(());
+    };
+
+    let export_id = app.next_cropped_video_export_id;
+    app.next_cropped_video_export_id += 1;
+
+    let temp_dir = create_cropped_video_temp_dir(export_id)?;
+    let fps = time_ctrl.fps().unwrap_or(30.0).max(1.0);
+
+    let export = CroppedVideoExport {
+        export_id,
+        store_id: store_context.recording.store_id().clone(),
+        original_timeline: *time_ctrl.timeline_name(),
+        original_time: time_ctrl.time(),
+        original_play_state: time_ctrl.play_state(),
+        export_area,
+        output_path,
+        temp_dir,
+        frame_times,
+        frame_index: 0,
+        frames_until_screenshot: 1,
+        phase: CroppedVideoExportPhase::AwaitRenderedFrame,
+        fps,
+    };
+
+    let first_time = export.frame_times[0];
+    app.command_sender
+        .send_system(SystemCommand::TimeControlCommands {
+            store_id: export.store_id.clone(),
+            time_commands: vec![
+                TimeControlCommand::SetActiveTimeline(timeline),
+                TimeControlCommand::SetPlayState(PlayState::Paused),
+                TimeControlCommand::SetTime(first_time.into()),
+            ],
+        });
+
+    re_log::info!(
+        "Starting video export for {:?} with {} frame(s).",
+        export.export_area.name,
+        export.frame_times.len()
+    );
+
+    app.cropped_video_export = Some(export);
+    app.egui_ctx.request_repaint();
+
+    Ok(())
 }
 
 fn save_active_recording(
@@ -3763,6 +4265,109 @@ async fn async_save_dialog(
     let mut bytes = Vec::new();
     re_log_encoding::Encoder::encode_into(rrd_version, options, messages, &mut bytes)?;
     file_handle.write(&bytes).await.context("Failed to save")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_ffmpeg_available() -> anyhow::Result<()> {
+    let output = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(_) => anyhow::bail!("`ffmpeg` is installed but unavailable for video export"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("`ffmpeg` was not found on PATH. Install ffmpeg to export MP4 videos.")
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn create_cropped_video_temp_dir(export_id: u64) -> anyhow::Result<std::path::PathBuf> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = std::env::temp_dir().join(format!(
+        "rerun-cropped-video-{}-{}-{}",
+        std::process::id(),
+        export_id,
+        millis
+    ));
+    std::fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cropped_video_frame_path(temp_dir: &std::path::Path, frame_index: usize) -> std::path::PathBuf {
+    temp_dir.join(format!("frame_{frame_index:06}.png"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_cropped_video_frame_png(
+    temp_dir: &std::path::Path,
+    frame_index: usize,
+    image: &egui::ColorImage,
+) -> anyhow::Result<()> {
+    use image::ImageEncoder as _;
+
+    let path = cropped_video_frame_path(temp_dir, frame_index);
+    let mut file = std::fs::File::create(&path)?;
+    image::codecs::png::PngEncoder::new(&mut file).write_image(
+        image.as_raw(),
+        image.width() as u32,
+        image.height() as u32,
+        image::ExtendedColorType::Rgba8,
+    )?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn encode_cropped_video_frames(
+    temp_dir: &std::path::Path,
+    output_path: &std::path::Path,
+    fps: f32,
+) -> anyhow::Result<std::path::PathBuf> {
+    let input_pattern = temp_dir.join("frame_%06d.png");
+
+    let output = std::process::Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-framerate")
+        .arg(fps.to_string())
+        .arg("-i")
+        .arg(&input_pattern)
+        .arg("-vf")
+        .arg("pad=ceil(iw/2)*2:ceil(ih/2)*2")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg(output_path)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "ffmpeg failed to encode {:?}: {stderr}\nTemporary frames kept at {:?}",
+            output_path,
+            temp_dir
+        );
+    }
+
+    if let Err(err) = std::fs::remove_dir_all(temp_dir)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        re_log::debug!(
+            "Failed to clean up temporary video frames at {:?}: {err}",
+            temp_dir
+        );
+    }
+
+    Ok(output_path.to_path_buf())
 }
 
 /// Propagates [`re_viewer_context::TimeControlResponse`] to [`ViewerEventDispatcher`].

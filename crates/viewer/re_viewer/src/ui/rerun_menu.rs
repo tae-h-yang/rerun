@@ -238,10 +238,14 @@ impl App {
     fn save_buttons_ui(&self, ui: &mut egui::Ui, store_ctx: Option<&StoreContext<'_>>) {
         use re_ui::UICommandSender as _;
 
-        let file_save_in_progress = self.background_tasks.is_file_save_in_progress();
+        let file_save_in_progress = self.background_tasks.is_file_save_in_progress()
+            || self
+                .background_tasks
+                .is_promise_in_progress("cropped_video_export");
 
         let save_recording_button = UICommand::SaveRecording.menu_button(ui.ctx());
         let save_selection_button = UICommand::SaveRecordingSelection.menu_button(ui.ctx());
+        let save_video_button = UICommand::SaveVideoSelection.menu_button(ui.ctx());
 
         if file_save_in_progress {
             ui.add_enabled_ui(false, |ui| {
@@ -251,6 +255,10 @@ impl App {
                 });
                 ui.horizontal(|ui| {
                     ui.add(save_selection_button);
+                    ui.spinner();
+                });
+                ui.horizontal(|ui| {
+                    ui.add(save_video_button);
                     ui.spinner();
                 });
             });
@@ -270,6 +278,9 @@ impl App {
                 // button, as this will determine whether its grayed out or not!
                 // TODO(cmc): In practice the loop (green) selection is always there
                 // at the moment so…
+                let has_video_export_view = store_ctx
+                    .and_then(|ctx| self.video_export_area(ctx))
+                    .is_some();
                 let loop_selection = self.state.loop_selection(store_ctx);
 
                 if ui
@@ -282,6 +293,19 @@ impl App {
                     ui.close();
                     self.command_sender
                         .send_ui(UICommand::SaveRecordingSelection);
+                }
+
+                if ui
+                    .add_enabled(has_video_export_view, save_video_button)
+                    .on_hover_text(if loop_selection.is_some() {
+                        "Save the current viewport layout within the current crop range to an MP4 video"
+                    } else {
+                        "Save the current viewport layout over the full current run to an MP4 video"
+                    })
+                    .clicked()
+                {
+                    ui.close();
+                    self.command_sender.send_ui(UICommand::SaveVideoSelection);
                 }
             });
         }

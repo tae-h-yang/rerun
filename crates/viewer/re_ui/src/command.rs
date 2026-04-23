@@ -34,6 +34,7 @@ pub enum UICommand {
     /// Save the current recording, or all selected recordings
     SaveRecording,
     SaveRecordingSelection,
+    SaveVideoSelection,
     SaveBlueprint,
     CloseCurrentRecording,
     CloseAllEntries,
@@ -150,6 +151,11 @@ impl UICommand {
             Self::SaveRecordingSelection => (
                 "Save cropped recording…",
                 "Save data within the current crop range to a Rerun data file (.rrd)",
+            ),
+
+            Self::SaveVideoSelection => (
+                "Save video…",
+                "Save the selected view to an MP4 video, using the crop range if one is set",
             ),
 
             Self::SaveBlueprint => (
@@ -418,6 +424,7 @@ impl UICommand {
         match self {
             Self::SaveRecording => smallvec![cmd(Key::S)],
             Self::SaveRecordingSelection => smallvec![cmd_shift(Key::S)],
+            Self::SaveVideoSelection => smallvec![],
             Self::SaveBlueprint => smallvec![],
             Self::Open => smallvec![cmd(Key::O)],
             // Some browsers have a "paste and go" action.

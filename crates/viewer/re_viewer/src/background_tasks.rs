@@ -78,4 +78,8 @@ impl BackgroundTasks {
     pub fn is_file_save_in_progress(&self) -> bool {
         self.promises.contains_key(FILE_SAVER_PROMISE)
     }
+
+    pub fn is_promise_in_progress(&self, name: impl AsRef<str>) -> bool {
+        self.promises.contains_key(name.as_ref())
+    }
 }

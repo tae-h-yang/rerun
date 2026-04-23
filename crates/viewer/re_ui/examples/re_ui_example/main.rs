@@ -492,6 +492,7 @@ impl ExampleApp {
 fn file_menu(ui: &mut egui::Ui, command_sender: &CommandSender) {
     UICommand::SaveRecording.menu_button_ui(ui, command_sender);
     UICommand::SaveRecordingSelection.menu_button_ui(ui, command_sender);
+    UICommand::SaveVideoSelection.menu_button_ui(ui, command_sender);
     UICommand::Open.menu_button_ui(ui, command_sender);
     UICommand::Quit.menu_button_ui(ui, command_sender);
 }

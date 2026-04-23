@@ -390,6 +390,19 @@ fn selection_context_menu(
             .send_ui(UICommand::SaveRecordingSelection);
     }
 
+    if ui
+        .add_enabled(
+            is_on_selection,
+            egui::Button::new(UICommand::SaveVideoSelection.text()),
+        )
+        .on_disabled_hover_text(
+            "Open the context menu on selected time to save video for that range",
+        )
+        .clicked()
+    {
+        ctx.command_sender().send_ui(UICommand::SaveVideoSelection);
+    }
+
     let mut url = ViewerOpenUrl::from_context(ctx);
     let has_time_range = url.as_mut().is_ok_and(|url| url.fragment_mut().is_some());
     let copy_command = url.and_then(|url| url.copy_url_command());
